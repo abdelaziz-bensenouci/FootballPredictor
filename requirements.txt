@@ -1,0 +1,10 @@
+
+PySide6
+requests
+pandas
+numpy
+scipy
+scikit-learn
+SQLAlchemy
+APScheduler
+pytest
