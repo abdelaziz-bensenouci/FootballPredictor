@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from data_sources.football_data import fetch_matches, fetch_historical_matches
 from database import (
-    initialize_database, get_matches, get_history, save_prediction,
+    initialize_database, get_matches, get_history, save_prediction_if_changed,
     upsert_api_matches,
 )
 from models.team_stats import estimate_expected_goals
@@ -132,6 +132,32 @@ class HistoryFetchWorker(QThread):
             self.fetch_error.emit(str(error))
 
 
+class FullUpdateWorker(QThread):
+    """Récupère les calendriers et les résultats récents sans bloquer l'interface."""
+    update_ready = Signal(list, list, str, str)
+    progress = Signal(str)
+
+    def run(self):
+        upcoming = []
+        historical = []
+        upcoming_error = ""
+        historical_error = ""
+
+        self.progress.emit("Récupération des matchs à venir…")
+        try:
+            upcoming = list(fetch_matches() or [])
+        except Exception as error:
+            upcoming_error = str(error)
+
+        self.progress.emit("Récupération des résultats récents…")
+        try:
+            historical = list(fetch_historical_matches(days_back=9) or [])
+        except Exception as error:
+            historical_error = str(error)
+
+        self.update_ready.emit(upcoming, historical, upcoming_error, historical_error)
+
+
 class FootballPredictor(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -140,6 +166,7 @@ class FootballPredictor(QMainWindow):
         self.setMinimumSize(950, 650)
 
         self.history_worker = None
+        self.update_worker = None
         self.results_dialog = None
         self.results_table = None
         self.results_status = None
@@ -268,8 +295,8 @@ class FootballPredictor(QMainWindow):
         hero_title = QLabel("Vos prochains pronostics")
         hero_title.setObjectName("heroTitle")
         hero_text = QLabel(
-            "Actualisez les rencontres, puis calculez les pronostics qui manquent. "
-            "Les prédictions reposent sur votre modèle statistique actuel."
+            "Clique sur « Mettre à jour » pour récupérer les matchs et les résultats récents, "
+            "puis recalculer les pronostics disponibles."
         )
         hero_text.setObjectName("heroText")
         hero_text.setWordWrap(True)
@@ -278,8 +305,12 @@ class FootballPredictor(QMainWindow):
 
         actions = QHBoxLayout()
         actions.setSpacing(10)
-        self.refresh_button = QPushButton("Actualiser les matchs")
-        self.refresh_button.clicked.connect(self.refresh_matches_from_api)
+        self.refresh_button = QPushButton("Mettre à jour")
+        self.refresh_button.setObjectName("primary")
+        self.refresh_button.setToolTip(
+            "Récupérer les matchs et résultats disponibles, puis recalculer les pronostics"
+        )
+        self.refresh_button.clicked.connect(self.start_full_update)
         self.predict_button = QPushButton("Calculer les pronostics")
         self.predict_button.setObjectName("primary")
         self.predict_button.clicked.connect(self.calculate_predictions)
@@ -424,6 +455,7 @@ class FootballPredictor(QMainWindow):
         try:
             evaluated = 0
             correct = 0
+            seen_matches = set()
 
             for row in get_history():
                 if row["is_demo"] or row["prediction_is_demo"]:
@@ -435,6 +467,19 @@ class FootballPredictor(QMainWindow):
                 away_goals = row["away_goals"]
                 if home_goals is None or away_goals is None:
                     continue
+
+                # L'historique contient une ligne par version du pronostic.
+                # Compter uniquement la version la plus récente de chaque match,
+                # comme dans la page « Résultats ».
+                match_key = (
+                    row["competition"],
+                    row["home_team"],
+                    row["away_team"],
+                    row["kickoff"],
+                )
+                if match_key in seen_matches:
+                    continue
+                seen_matches.add(match_key)
 
                 winner = predicted_winner(row)
                 if winner == "À calculer":
@@ -465,30 +510,92 @@ class FootballPredictor(QMainWindow):
             self.success_rate_hint.setText("Calcul indisponible")
             self.success_rate_value.setToolTip(str(error))
 
-    def refresh_matches_from_api(self):
-        """Importe les matchs à venir depuis l'API (fonction synchrone)."""
-        self.refresh_button.setEnabled(False)
-        try:
-            matches = fetch_matches()
-            saved = upsert_api_matches(matches)
-            self.refresh_table()
-            QMessageBox.information(
-                self, "Actualisation terminée",
-                f"Matchs reçus de l'API : {len(matches)}\n"
-                f"Matchs enregistrés ou actualisés : {saved}\n\n"
-                "Tu peux maintenant calculer les pronostics manquants.",
-            )
-        except Exception as error:
-            QMessageBox.critical(self, "Erreur d'actualisation", f"Impossible d'actualiser les matchs :\n\n{error}")
-        finally:
-            self.refresh_button.setEnabled(True)
+    def start_full_update(self):
+        """Lance la mise à jour manuelle complète dans un thread de collecte."""
+        if self.update_worker is not None and self.update_worker.isRunning():
+            return
 
-    def calculate_predictions(self):
-        """Calcule les pronostics manquants pour les matchs futurs."""
+        self.refresh_button.setEnabled(False)
+        self.predict_button.setEnabled(False)
+        self.status_label.setText("Démarrage de la mise à jour…")
+        worker = FullUpdateWorker(self)
+        self.update_worker = worker
+        worker.progress.connect(self.status_label.setText)
+        worker.update_ready.connect(self._on_full_update_ready)
+        worker.finished.connect(self._on_full_update_finished)
+        worker.start()
+
+    def _on_full_update_ready(self, upcoming, historical, upcoming_error, historical_error):
+        """Enregistre les données récupérées puis recalcule les pronostics."""
+        upcoming_saved = 0
+        historical_saved = 0
+        errors = []
+
+        try:
+            if upcoming:
+                upcoming_saved = upsert_api_matches(upcoming)
+            if historical:
+                historical_saved = upsert_api_matches(historical)
+
+            self.status_label.setText("Données enregistrées. Calcul des pronostics…")
+            created, recalculated, unchanged, skipped_invalid, prediction_errors = self.calculate_predictions(
+                show_message=False
+            )
+            self.refresh_table()
+
+            if upcoming_error:
+                errors.append(f"Matchs à venir : {upcoming_error}")
+            if historical_error:
+                errors.append(f"Résultats récents : {historical_error}")
+            if prediction_errors:
+                errors.append("Quelques pronostics n'ont pas pu être calculés :")
+                errors.extend(prediction_errors)
+
+            summary = (
+                f"Matchs à venir reçus : {len(upcoming)}\n"
+                f"Matchs à venir enregistrés/actualisés : {upcoming_saved}\n"
+                f"Résultats récents reçus : {len(historical)}\n"
+                f"Résultats enregistrés/actualisés : {historical_saved}\n\n"
+                f"Nouveaux pronostics créés : {created}\n"
+                f"Pronostics recalculés : {recalculated}\n"
+                f"Pronostics inchangés : {unchanged}\n"
+                f"Dates invalides ignorées : {skipped_invalid}"
+            )
+            if errors:
+                summary += "\n\nPoints à vérifier :\n" + "\n".join(errors[:8])
+                self.status_label.setText("Mise à jour terminée avec des avertissements. Consulte le bilan.")
+                QMessageBox.warning(self, "Mise à jour partielle", summary)
+            else:
+                self.status_label.setText(
+                    f"Mise à jour terminée : {len(upcoming)} match(s), "
+                    f"{len(historical)} résultat(s) récent(s), {created} nouveau(x), "
+                    f"{recalculated} recalculé(s), {unchanged} inchangé(s)."
+                )
+                QMessageBox.information(self, "Mise à jour terminée", summary)
+
+        except Exception as error:
+            self.status_label.setText(f"Échec de la mise à jour : {error}")
+            QMessageBox.critical(
+                self, "Erreur de mise à jour",
+                f"Une erreur est survenue pendant l'enregistrement ou le calcul :\n\n{error}"
+            )
+
+    def _on_full_update_finished(self):
+        worker = self.sender()
+        if worker is self.update_worker:
+            self.update_worker = None
+        self.refresh_button.setEnabled(True)
+        self.predict_button.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
+
+    def calculate_predictions(self, show_message=True):
+        """Crée les pronostics manquants et recalcule ceux dont les données ont changé."""
         now = datetime.now(timezone.utc)
         rows = get_matches()
         created = 0
-        already_present = 0
+        recalculated = 0
+        unchanged = 0
         skipped_invalid = 0
         errors = []
         self.predict_button.setEnabled(False)
@@ -502,9 +609,7 @@ class FootballPredictor(QMainWindow):
                     continue
                 if kickoff <= now or row["prediction_is_demo"]:
                     continue
-                if row["model_version"] == MODEL_VERSION:
-                    already_present += 1
-                    continue
+
                 try:
                     stats = estimate_expected_goals(row["id"])
                     prediction = predict_match(
@@ -519,23 +624,37 @@ class FootballPredictor(QMainWindow):
                         "expected_goals_home": stats["expected_goals_home"],
                         "expected_goals_away": stats["expected_goals_away"],
                     }
-                    save_prediction(row["id"], prediction, source_snapshot=json.dumps(snapshot, ensure_ascii=False))
-                    created += 1
-                except (ValueError, KeyError) as error:
-                    if len(errors) < 5:
+                    action = save_prediction_if_changed(
+                        row["id"], prediction,
+                        source_snapshot=json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    )
+                    if action == "created":
+                        created += 1
+                    elif action == "recalculated":
+                        recalculated += 1
+                    else:
+                        unchanged += 1
+                except Exception as error:
+                    if len(errors) < 8:
                         errors.append(f"{row['home_team']} - {row['away_team']} : {error}")
+
             self.refresh_table()
             message = (
-                f"Nouveaux pronostics : {created}\n"
-                f"Pronostics déjà présents : {already_present}\n"
+                f"Nouveaux pronostics créés : {created}\n"
+                f"Pronostics recalculés : {recalculated}\n"
+                f"Pronostics inchangés : {unchanged}\n"
                 f"Dates invalides : {skipped_invalid}\n"
-                f"Exemples de matchs non calculés : {len(errors)}"
+                f"Erreurs de calcul : {len(errors)}"
             )
             if errors:
                 message += "\n\n" + "\n".join(errors)
-            QMessageBox.information(self, "Calcul terminé", message)
+            if show_message:
+                QMessageBox.information(self, "Calcul terminé", message)
+            return created, recalculated, unchanged, skipped_invalid, errors
         except Exception as error:
-            QMessageBox.critical(self, "Erreur de calcul", str(error))
+            if show_message:
+                QMessageBox.critical(self, "Erreur de calcul", str(error))
+            raise
         finally:
             self.predict_button.setEnabled(True)
 
@@ -592,6 +711,7 @@ class FootballPredictor(QMainWindow):
             return
         try:
             completed = []
+            seen_matches = set()
             for row in get_history():
                 if row["is_demo"] or row["prediction_is_demo"]:
                     continue
@@ -599,6 +719,18 @@ class FootballPredictor(QMainWindow):
                     continue
                 if row["home_goals"] is None or row["away_goals"] is None:
                     continue
+                # get_history() contient une ligne par pronostic. Ne montrer
+                # qu'une seule ligne par match, en conservant le pronostic le
+                # plus récent (la requête est déjà triée du plus récent au plus ancien).
+                match_key = (
+                    row["competition"],
+                    row["home_team"],
+                    row["away_team"],
+                    row["kickoff"],
+                )
+                if match_key in seen_matches:
+                    continue
+                seen_matches.add(match_key)
                 completed.append(row)
             completed.sort(key=lambda row: row["kickoff"] or "", reverse=True)
             table.setUpdatesEnabled(False)

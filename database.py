@@ -374,82 +374,87 @@ def upsert_api_matches(api_matches):
 
     return saved
 
+def _insert_prediction(connection, match_id, prediction, source_snapshot=None):
+    """Insère une nouvelle version d'un pronostic dans l'historique."""
+    match = connection.execute(
+        "SELECT is_demo FROM matches WHERE id = ?", (match_id,)
+    ).fetchone()
+    if match is None:
+        raise ValueError(f"Match introuvable : {match_id}")
+    if match["is_demo"]:
+        raise ValueError("Un match fictif ne peut pas recevoir un pronostic réel.")
+
+    cursor = connection.execute("""
+        INSERT INTO predictions (
+            match_id, model_version,
+            p_home, p_draw, p_away,
+            p_over25, p_under25,
+            p_btts_yes, p_btts_no,
+            source_snapshot, is_demo
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    """, (
+        match_id,
+        prediction["model_version"],
+        prediction["p_home"],
+        prediction["p_draw"],
+        prediction["p_away"],
+        prediction["p_over25"],
+        prediction["p_under25"],
+        prediction["p_btts_yes"],
+        prediction["p_btts_no"],
+        source_snapshot,
+    ))
+    return cursor.lastrowid
+
+
 def save_prediction(match_id, prediction, source_snapshot=None):
-    """Enregistre un nouveau pronostic sans modifier l'historique."""
+    """Ajoute une nouvelle version de pronostic sans supprimer l'historique."""
+    with get_connection() as connection:
+        return _insert_prediction(connection, match_id, prediction, source_snapshot)
+
+
+def save_prediction_if_changed(match_id, prediction, source_snapshot=None):
+    """Crée ou actualise logiquement un pronostic, sans ajouter de doublon identique.
+
+    Retourne « created », « recalculated » ou « unchanged ».
+    Les versions antérieures restent dans la table predictions.
+    """
+    probability_fields = (
+        "p_home", "p_draw", "p_away", "p_over25", "p_under25",
+        "p_btts_yes", "p_btts_no",
+    )
     with get_connection() as connection:
         match = connection.execute(
-            "SELECT is_demo FROM matches WHERE id = ?",
-            (match_id,),
+            "SELECT is_demo FROM matches WHERE id = ?", (match_id,)
         ).fetchone()
-
         if match is None:
             raise ValueError(f"Match introuvable : {match_id}")
-
-        cursor = connection.execute("""
-            INSERT INTO predictions (
-                match_id,
-                model_version,
-                p_home,
-                p_draw,
-                p_away,
-                p_over25,
-                p_under25,
-                p_btts_yes,
-                p_btts_no,
-                source_snapshot,
-                is_demo
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            match_id,
-            prediction["model_version"],
-            prediction["p_home"],
-            prediction["p_draw"],
-            prediction["p_away"],
-            prediction["p_over25"],
-            prediction["p_under25"],
-            prediction["p_btts_yes"],
-            prediction["p_btts_no"],
-            source_snapshot,
-            match["is_demo"],
-        ))
-
-        return cursor.lastrowid
-    
-def save_prediction(match_id, prediction, source_snapshot=None):
-    """Ajoute un pronostic sans modifier les pronostics précédents."""
-    with get_connection() as connection:
-        match = connection.execute(
-            "SELECT is_demo FROM matches WHERE id = ?",
-            (match_id,),
-        ).fetchone()
-
-        if match is None:
-            raise ValueError(f"Match introuvable : {match_id}")
-
         if match["is_demo"]:
             raise ValueError("Un match fictif ne peut pas recevoir un pronostic réel.")
 
-        cursor = connection.execute("""
-            INSERT INTO predictions (
-                match_id, model_version,
-                p_home, p_draw, p_away,
-                p_over25, p_under25,
-                p_btts_yes, p_btts_no,
-                source_snapshot, is_demo
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-        """, (
-            match_id,
-            prediction["model_version"],
-            prediction["p_home"],
-            prediction["p_draw"],
-            prediction["p_away"],
-            prediction["p_over25"],
-            prediction["p_under25"],
-            prediction["p_btts_yes"],
-            prediction["p_btts_no"],
-            source_snapshot,
-        ))
+        previous = connection.execute("""
+            SELECT model_version, p_home, p_draw, p_away,
+                   p_over25, p_under25, p_btts_yes, p_btts_no,
+                   source_snapshot
+            FROM predictions
+            WHERE match_id = ? AND is_demo = 0
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        """, (match_id,)).fetchone()
 
-        return cursor.lastrowid
+        if previous is None:
+            _insert_prediction(connection, match_id, prediction, source_snapshot)
+            return "created"
+
+        same_model = previous["model_version"] == prediction["model_version"]
+        same_snapshot = (previous["source_snapshot"] or "") == (source_snapshot or "")
+        same_probabilities = all(
+            abs(float(previous[field]) - float(prediction[field])) < 1e-9
+            for field in probability_fields
+        )
+        if same_model and same_snapshot and same_probabilities:
+            return "unchanged"
+
+        _insert_prediction(connection, match_id, prediction, source_snapshot)
+        return "recalculated"
